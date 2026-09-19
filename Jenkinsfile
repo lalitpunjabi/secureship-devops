@@ -177,6 +177,7 @@ pipeline {
                     trivy image \
                         --cache-dir "${TRIVY_CACHE_DIR}" \
                         --severity "${TRIVY_SEVERITY}" \
+                        --exit-code 1 \
                         --format table \
                         "${FULL_IMAGE}" \
                         > evidence/trivy-image.txt 2>&1
@@ -188,11 +189,12 @@ pipeline {
                     echo "Trivy exit code: ${TRIVY_EXIT}"
 
                     if [ "${TRIVY_EXIT}" -ne 0 ]; then
-                        echo "Trivy detected HIGH or CRITICAL vulnerabilities."
+                        echo "Trivy security gate FAILED."
+                        echo "HIGH or CRITICAL vulnerabilities were detected."
                         exit "${TRIVY_EXIT}"
                     fi
 
-                    echo "Trivy security scan passed."
+                    echo "Trivy security gate passed."
                 '''
             }
         }
@@ -213,39 +215,92 @@ pipeline {
                         --cap-drop=ALL \
                         "${FULL_IMAGE}"
 
-                    echo "Waiting for application..."
+                    echo "Waiting for application health..."
 
-                    sleep 5
+                    HEALTH_STATUS="starting"
+                    ATTEMPTS=0
+                    MAX_ATTEMPTS=12
+
+                    while [ "${ATTEMPTS}" -lt "${MAX_ATTEMPTS}" ]; do
+
+                        HEALTH_STATUS=$(docker inspect \
+                            --format '{{.State.Health.Status}}' \
+                            secureship-security-test 2>/dev/null || echo "unknown")
+
+                        echo "Health status: ${HEALTH_STATUS}"
+
+                        if [ "${HEALTH_STATUS}" = "healthy" ]; then
+                            break
+                        fi
+
+                        if [ "${HEALTH_STATUS}" = "unhealthy" ]; then
+                            echo "Container became unhealthy."
+                            docker logs secureship-security-test || true
+                            exit 1
+                        fi
+
+                        ATTEMPTS=$((ATTEMPTS + 1))
+
+                        sleep 2
+                    done
+
+                    if [ "${HEALTH_STATUS}" != "healthy" ]; then
+                        echo "Container did not become healthy within the expected time."
+                        echo "Final health status: ${HEALTH_STATUS}"
+
+                        docker logs secureship-security-test || true
+
+                        docker inspect secureship-security-test \
+                            --format '{{json .State.Health}}' || true
+
+                        exit 1
+                    fi
+
+                    echo "Container health check passed."
 
                     echo "Checking container user..."
 
                     USER_NAME=$(docker exec secureship-security-test whoami)
 
-                    if [ "${USER_NAME}" != "node" ]; then
-                        echo "Container is not running as non-root user."
-                        docker logs secureship-security-test
-                        exit 1
-                    fi
-
                     echo "Container user: ${USER_NAME}"
 
-                    echo "Checking container health..."
-
-                    HEALTH_STATUS=$(docker inspect \
-                        --format '{{.State.Health.Status}}' \
-                        secureship-security-test)
-
-                    echo "Health status: ${HEALTH_STATUS}"
-
-                    if [ "${HEALTH_STATUS}" != "healthy" ]; then
-                        echo "Security validation container is not healthy."
-                        docker logs secureship-security-test
+                    if [ "${USER_NAME}" != "node" ]; then
+                        echo "ERROR: Container is not running as node."
                         exit 1
                     fi
 
-                    echo "Runtime security validation passed."
+                    echo "Checking read-only root filesystem..."
 
-                    docker rm -f secureship-security-test
+                    READONLY_ROOT=$(docker inspect \
+                        --format '{{.HostConfig.ReadonlyRootfs}}' \
+                        secureship-security-test)
+
+                    echo "ReadonlyRootfs: ${READONLY_ROOT}"
+
+                    if [ "${READONLY_ROOT}" != "true" ]; then
+                        echo "ERROR: Root filesystem is not read-only."
+                        exit 1
+                    fi
+
+                    echo "Checking dropped capabilities..."
+
+                    CAP_DROP=$(docker inspect \
+                        --format '{{json .HostConfig.CapDrop}}' \
+                        secureship-security-test)
+
+                    echo "CapDrop: ${CAP_DROP}"
+
+                    case "${CAP_DROP}" in
+                        *ALL*)
+                            echo "All Linux capabilities dropped."
+                            ;;
+                        *)
+                            echo "ERROR: ALL capabilities were not dropped."
+                            exit 1
+                            ;;
+                    esac
+
+                    echo "Runtime security validation passed."
                 '''
             }
         }
@@ -292,11 +347,14 @@ pipeline {
                             > /tmp/secureship-health.json; then
 
                             echo "Candidate health check passed."
+
                             cat /tmp/secureship-health.json
+
                             exit 0
                         fi
 
                         echo "Health check attempt ${i}/12 failed."
+
                         sleep 2
                     done
 
@@ -315,12 +373,14 @@ pipeline {
                     set -eu
 
                     echo "Testing /health..."
+
                     curl -fsS \
                         "http://127.0.0.1:${CANDIDATE_PORT}/health"
 
                     echo
 
                     echo "Testing root endpoint..."
+
                     curl -fsS \
                         "http://127.0.0.1:${CANDIDATE_PORT}/"
 
@@ -342,6 +402,8 @@ pipeline {
 
                     USER_NAME=$(docker exec "${CANDIDATE_CONTAINER}" whoami)
 
+                    echo "Container user: ${USER_NAME}"
+
                     if [ "${USER_NAME}" != "node" ]; then
                         echo "Deployment verification failed: container is running as ${USER_NAME}"
                         exit 1
@@ -351,10 +413,39 @@ pipeline {
                         --format '{{.State.Health.Status}}' \
                         "${CANDIDATE_CONTAINER}")
 
+                    echo "Container health: ${HEALTH_STATUS}"
+
                     if [ "${HEALTH_STATUS}" != "healthy" ]; then
                         echo "Deployment verification failed: health=${HEALTH_STATUS}"
                         exit 1
                     fi
+
+                    READONLY_ROOT=$(docker inspect \
+                        --format '{{.HostConfig.ReadonlyRootfs}}' \
+                        "${CANDIDATE_CONTAINER}")
+
+                    echo "ReadonlyRootfs: ${READONLY_ROOT}"
+
+                    if [ "${READONLY_ROOT}" != "true" ]; then
+                        echo "Deployment verification failed: root filesystem is writable."
+                        exit 1
+                    fi
+
+                    CAP_DROP=$(docker inspect \
+                        --format '{{json .HostConfig.CapDrop}}' \
+                        "${CANDIDATE_CONTAINER}")
+
+                    echo "CapDrop: ${CAP_DROP}"
+
+                    case "${CAP_DROP}" in
+                        *ALL*)
+                            echo "All Linux capabilities dropped."
+                            ;;
+                        *)
+                            echo "Deployment verification failed: ALL capabilities were not dropped."
+                            exit 1
+                            ;;
+                    esac
 
                     echo "Deployment verification passed."
                 '''
@@ -375,6 +466,7 @@ pipeline {
                         echo "Stopping existing production container..."
 
                         docker stop "${CONTAINER_NAME}"
+
                         docker rm "${CONTAINER_NAME}"
 
                     else
@@ -411,6 +503,7 @@ pipeline {
                         fi
 
                         echo "Production health attempt ${i}/12 failed."
+
                         sleep 2
                     done
 
@@ -422,7 +515,6 @@ pipeline {
                 '''
             }
         }
-
     }
 
     post {
