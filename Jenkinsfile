@@ -172,15 +172,18 @@ pipeline {
                     mkdir -p evidence
 
                     echo "Running Trivy security scan..."
+                    echo "Trivy cache: ${TRIVY_CACHE_DIR}"
 
                     trivy image \
                         --cache-dir "${TRIVY_CACHE_DIR}" \
                         --severity "${TRIVY_SEVERITY}" \
                         --format table \
                         "${FULL_IMAGE}" \
-                        2>&1 | tee evidence/trivy-image.txt
+                        > evidence/trivy-image.txt 2>&1
 
-                    TRIVY_EXIT=${PIPESTATUS[0]}
+                    TRIVY_EXIT=$?
+
+                    cat evidence/trivy-image.txt
 
                     echo "Trivy exit code: ${TRIVY_EXIT}"
 
