@@ -25,6 +25,7 @@ pipeline {
         CANDIDATE_PORT = '3001'
 
         TRIVY_SEVERITY = 'HIGH,CRITICAL'
+        TRIVY_CACHE_DIR = '/data/trivy-cache'
     }
 
     stages {
@@ -173,6 +174,7 @@ pipeline {
                     echo "Running Trivy security scan..."
 
                     trivy image \
+                        --cache-dir "${TRIVY_CACHE_DIR}" \
                         --severity "${TRIVY_SEVERITY}" \
                         --format table \
                         "${FULL_IMAGE}" \
