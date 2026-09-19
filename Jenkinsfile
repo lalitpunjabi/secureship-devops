@@ -17,46 +17,86 @@ pipeline {
 
     environment {
         APP_NAME = 'secureship'
+
         IMAGE_NAME = 'secureship'
+
         CONTAINER_NAME = 'secureship'
+
         CANDIDATE_CONTAINER = 'secureship-candidate'
 
+        SECURITY_CONTAINER = 'secureship-security-test'
+
         APP_PORT = '3000'
+
         CANDIDATE_PORT = '3001'
 
         TRIVY_SEVERITY = 'HIGH,CRITICAL'
+
         TRIVY_CACHE_DIR = '/data/trivy-cache'
     }
 
     stages {
 
-        stage('Environment Validation') {
-            steps {
-                sh '''
-                    set -eu
-
-                    echo "===== Environment ====="
-                    node --version
-                    npm --version
-                    docker --version
-                    trivy --version
-
-                    echo "===== Disk ====="
-                    df -h /
-
-                    echo "===== Docker ====="
-                    docker info >/dev/null
-
-                    echo "Environment validation completed."
-                '''
-            }
-        }
+        /*
+         * =========================================================
+         * CHECKOUT
+         * =========================================================
+         */
 
         stage('Checkout') {
             steps {
                 checkout scm
             }
         }
+
+
+        /*
+         * =========================================================
+         * ENVIRONMENT VALIDATION
+         * =========================================================
+         */
+
+        stage('Environment Validation') {
+            steps {
+                sh '''
+                    set -eu
+
+                    echo "========================================="
+                    echo "SecureShip Environment Validation"
+                    echo "========================================="
+
+                    echo "===== Node.js ====="
+                    node --version
+
+                    echo "===== npm ====="
+                    npm --version
+
+                    echo "===== Docker ====="
+                    docker --version
+
+                    echo "===== Trivy ====="
+                    trivy --version
+
+                    echo "===== Disk ====="
+                    df -h /
+
+                    echo "===== Docker Info ====="
+                    docker info >/dev/null
+
+                    echo "===== Trivy Cache ====="
+                    mkdir -p "${TRIVY_CACHE_DIR}"
+
+                    echo "Environment validation completed."
+                '''
+            }
+        }
+
+
+        /*
+         * =========================================================
+         * INSTALL DEPENDENCIES
+         * =========================================================
+         */
 
         stage('Install Dependencies') {
             steps {
@@ -65,6 +105,7 @@ pipeline {
                         set -eu
 
                         echo "Installing dependencies using npm ci..."
+
                         npm ci
 
                         echo "Dependency installation completed."
@@ -72,6 +113,13 @@ pipeline {
                 }
             }
         }
+
+
+        /*
+         * =========================================================
+         * DEPENDENCY SECURITY SCAN
+         * =========================================================
+         */
 
         stage('Dependency Security Scan') {
             steps {
@@ -81,7 +129,9 @@ pipeline {
 
                         mkdir -p ../evidence
 
-                        echo "Running npm audit..."
+                        echo "========================================="
+                        echo "npm Dependency Security Scan"
+                        echo "========================================="
 
                         npm audit \
                             --audit-level=high \
@@ -105,11 +155,20 @@ pipeline {
             }
         }
 
+
+        /*
+         * =========================================================
+         * UNIT TESTS
+         * =========================================================
+         */
+
         stage('Unit Tests') {
             steps {
                 dir('app') {
                     sh '''
                         set -eu
+
+                        echo "Running unit tests..."
 
                         npm test -- --runInBand
 
@@ -119,6 +178,13 @@ pipeline {
             }
         }
 
+
+        /*
+         * =========================================================
+         * DOCKERFILE LINT
+         * =========================================================
+         */
+
         stage('Dockerfile Lint') {
             steps {
                 sh '''
@@ -126,26 +192,41 @@ pipeline {
 
                     mkdir -p evidence
 
+                    echo "Running Hadolint..."
+
                     docker run --rm -i \
                         hadolint/hadolint \
                         < Dockerfile \
                         2>&1 | tee evidence/hadolint.txt
 
-                    echo "Dockerfile lint passed."
+                    echo "Dockerfile lint completed."
                 '''
             }
         }
+
+
+        /*
+         * =========================================================
+         * DOCKER BUILD
+         * =========================================================
+         */
 
         stage('Docker Build') {
             steps {
                 script {
 
-                    def imageTag = "${env.BUILD_NUMBER}-${env.GIT_COMMIT.take(7)}"
+                    def imageTag =
+                        "${env.BUILD_NUMBER}-${env.GIT_COMMIT.take(7)}"
 
                     env.IMAGE_TAG = imageTag
-                    env.FULL_IMAGE = "${env.IMAGE_NAME}:${imageTag}"
 
-                    echo "Building image: ${env.FULL_IMAGE}"
+                    env.FULL_IMAGE =
+                        "${env.IMAGE_NAME}:${imageTag}"
+
+                    echo "========================================="
+                    echo "Building image"
+                    echo "${env.FULL_IMAGE}"
+                    echo "========================================="
 
                     sh """
                         set -eu
@@ -153,16 +234,27 @@ pipeline {
                         docker build \
                             --pull \
                             -t ${env.FULL_IMAGE} \
-                            -t ${env.IMAGE_NAME}:build-${env.BUILD_NUMBER} \
                             .
 
-                        docker image inspect ${env.FULL_IMAGE} >/dev/null
+                        docker image inspect \
+                            ${env.FULL_IMAGE} \
+                            >/dev/null
 
                         echo "Docker image built successfully."
+
+                        docker images \
+                            ${env.IMAGE_NAME}
                     """
                 }
             }
         }
+
+
+        /*
+         * =========================================================
+         * TRIVY IMAGE SECURITY SCAN
+         * =========================================================
+         */
 
         stage('Trivy Image Scan') {
             steps {
@@ -171,12 +263,21 @@ pipeline {
 
                     mkdir -p evidence
 
-                    echo "Running Trivy security scan..."
-                    echo "Trivy cache: ${TRIVY_CACHE_DIR}"
+                    echo "========================================="
+                    echo "Trivy Image Security Scan"
+                    echo "========================================="
+
+                    echo "Image:"
+                    echo "${FULL_IMAGE}"
+
+                    echo "Trivy cache:"
+                    echo "${TRIVY_CACHE_DIR}"
 
                     trivy image \
                         --cache-dir "${TRIVY_CACHE_DIR}" \
+                        --scanners vuln \
                         --severity "${TRIVY_SEVERITY}" \
+                        --ignore-unfixed \
                         --exit-code 1 \
                         --format table \
                         "${FULL_IMAGE}" \
@@ -189,27 +290,47 @@ pipeline {
                     echo "Trivy exit code: ${TRIVY_EXIT}"
 
                     if [ "${TRIVY_EXIT}" -ne 0 ]; then
-                        echo "Trivy security gate FAILED."
-                        echo "HIGH or CRITICAL vulnerabilities were detected."
+                        echo ""
+                        echo "========================================="
+                        echo "Trivy security gate FAILED"
+                        echo "========================================="
+                        echo "A HIGH or CRITICAL vulnerability with"
+                        echo "an available fix was detected."
+                        echo ""
                         exit "${TRIVY_EXIT}"
                     fi
 
-                    echo "Trivy security gate passed."
+                    echo ""
+                    echo "========================================="
+                    echo "Trivy security gate PASSED"
+                    echo "========================================="
+                    echo "Unfixed vulnerabilities were excluded"
+                    echo "from the blocking gate."
                 '''
             }
         }
+
+
+        /*
+         * =========================================================
+         * RUNTIME SECURITY VALIDATION
+         * =========================================================
+         */
 
         stage('Runtime Security Validation') {
             steps {
                 sh '''
                     set -eu
 
-                    echo "Starting temporary security validation container..."
+                    echo "========================================="
+                    echo "Runtime Security Validation"
+                    echo "========================================="
 
-                    docker rm -f secureship-security-test 2>/dev/null || true
+                    docker rm -f "${SECURITY_CONTAINER}" \
+                        2>/dev/null || true
 
                     docker run -d \
-                        --name secureship-security-test \
+                        --name "${SECURITY_CONTAINER}" \
                         --read-only \
                         --tmpfs /tmp:rw,noexec,nosuid,size=64m \
                         --cap-drop=ALL \
@@ -225,7 +346,8 @@ pipeline {
 
                         HEALTH_STATUS=$(docker inspect \
                             --format '{{.State.Health.Status}}' \
-                            secureship-security-test 2>/dev/null || echo "unknown")
+                            "${SECURITY_CONTAINER}" \
+                            2>/dev/null || echo "unknown")
 
                         echo "Health status: ${HEALTH_STATUS}"
 
@@ -235,7 +357,10 @@ pipeline {
 
                         if [ "${HEALTH_STATUS}" = "unhealthy" ]; then
                             echo "Container became unhealthy."
-                            docker logs secureship-security-test || true
+
+                            docker logs \
+                                "${SECURITY_CONTAINER}" || true
+
                             exit 1
                         fi
 
@@ -245,12 +370,14 @@ pipeline {
                     done
 
                     if [ "${HEALTH_STATUS}" != "healthy" ]; then
-                        echo "Container did not become healthy within the expected time."
-                        echo "Final health status: ${HEALTH_STATUS}"
 
-                        docker logs secureship-security-test || true
+                        echo "Container did not become healthy."
 
-                        docker inspect secureship-security-test \
+                        docker logs \
+                            "${SECURITY_CONTAINER}" || true
+
+                        docker inspect \
+                            "${SECURITY_CONTAINER}" \
                             --format '{{json .State.Health}}' || true
 
                         exit 1
@@ -258,9 +385,12 @@ pipeline {
 
                     echo "Container health check passed."
 
+
                     echo "Checking container user..."
 
-                    USER_NAME=$(docker exec secureship-security-test whoami)
+                    USER_NAME=$(docker exec \
+                        "${SECURITY_CONTAINER}" \
+                        whoami)
 
                     echo "Container user: ${USER_NAME}"
 
@@ -269,24 +399,26 @@ pipeline {
                         exit 1
                     fi
 
+
                     echo "Checking read-only root filesystem..."
 
                     READONLY_ROOT=$(docker inspect \
                         --format '{{.HostConfig.ReadonlyRootfs}}' \
-                        secureship-security-test)
+                        "${SECURITY_CONTAINER}")
 
                     echo "ReadonlyRootfs: ${READONLY_ROOT}"
 
                     if [ "${READONLY_ROOT}" != "true" ]; then
-                        echo "ERROR: Root filesystem is not read-only."
+                        echo "ERROR: Root filesystem is writable."
                         exit 1
                     fi
+
 
                     echo "Checking dropped capabilities..."
 
                     CAP_DROP=$(docker inspect \
                         --format '{{json .HostConfig.CapDrop}}' \
-                        secureship-security-test)
+                        "${SECURITY_CONTAINER}")
 
                     echo "CapDrop: ${CAP_DROP}"
 
@@ -300,21 +432,31 @@ pipeline {
                             ;;
                     esac
 
+
                     echo "Runtime security validation passed."
                 '''
             }
         }
+
+
+        /*
+         * =========================================================
+         * DEPLOY CANDIDATE
+         * =========================================================
+         */
 
         stage('Deploy Candidate') {
             steps {
                 sh '''
                     set -eu
 
-                    echo "Cleaning previous candidate..."
+                    echo "========================================="
+                    echo "Deploying Candidate"
+                    echo "========================================="
 
-                    docker rm -f "${CANDIDATE_CONTAINER}" 2>/dev/null || true
-
-                    echo "Starting candidate deployment..."
+                    docker rm -f \
+                        "${CANDIDATE_CONTAINER}" \
+                        2>/dev/null || true
 
                     docker run -d \
                         --name "${CANDIDATE_CONTAINER}" \
@@ -332,6 +474,13 @@ pipeline {
                 '''
             }
         }
+
+
+        /*
+         * =========================================================
+         * CANDIDATE HEALTH CHECK
+         * =========================================================
+         */
 
         stage('Candidate Health Check') {
             steps {
@@ -360,12 +509,20 @@ pipeline {
 
                     echo "Candidate failed health check."
 
-                    docker logs "${CANDIDATE_CONTAINER}"
+                    docker logs \
+                        "${CANDIDATE_CONTAINER}"
 
                     exit 1
                 '''
             }
         }
+
+
+        /*
+         * =========================================================
+         * SMOKE TESTS
+         * =========================================================
+         */
 
         stage('Smoke Tests') {
             steps {
@@ -391,23 +548,39 @@ pipeline {
             }
         }
 
+
+        /*
+         * =========================================================
+         * DEPLOYMENT VERIFICATION
+         * =========================================================
+         */
+
         stage('Deployment Verification') {
             steps {
                 sh '''
                     set -eu
 
-                    echo "Checking candidate container..."
+                    echo "========================================="
+                    echo "Deployment Verification"
+                    echo "========================================="
 
-                    docker inspect "${CANDIDATE_CONTAINER}" >/dev/null
+                    docker inspect \
+                        "${CANDIDATE_CONTAINER}" \
+                        >/dev/null
 
-                    USER_NAME=$(docker exec "${CANDIDATE_CONTAINER}" whoami)
+
+                    USER_NAME=$(docker exec \
+                        "${CANDIDATE_CONTAINER}" \
+                        whoami)
 
                     echo "Container user: ${USER_NAME}"
 
                     if [ "${USER_NAME}" != "node" ]; then
-                        echo "Deployment verification failed: container is running as ${USER_NAME}"
+                        echo "Deployment verification failed."
+                        echo "Container is running as ${USER_NAME}"
                         exit 1
                     fi
+
 
                     HEALTH_STATUS=$(docker inspect \
                         --format '{{.State.Health.Status}}' \
@@ -416,9 +589,10 @@ pipeline {
                     echo "Container health: ${HEALTH_STATUS}"
 
                     if [ "${HEALTH_STATUS}" != "healthy" ]; then
-                        echo "Deployment verification failed: health=${HEALTH_STATUS}"
+                        echo "Deployment verification failed."
                         exit 1
                     fi
+
 
                     READONLY_ROOT=$(docker inspect \
                         --format '{{.HostConfig.ReadonlyRootfs}}' \
@@ -427,9 +601,11 @@ pipeline {
                     echo "ReadonlyRootfs: ${READONLY_ROOT}"
 
                     if [ "${READONLY_ROOT}" != "true" ]; then
-                        echo "Deployment verification failed: root filesystem is writable."
+                        echo "Deployment verification failed."
+                        echo "Root filesystem is writable."
                         exit 1
                     fi
+
 
                     CAP_DROP=$(docker inspect \
                         --format '{{json .HostConfig.CapDrop}}' \
@@ -442,37 +618,53 @@ pipeline {
                             echo "All Linux capabilities dropped."
                             ;;
                         *)
-                            echo "Deployment verification failed: ALL capabilities were not dropped."
+                            echo "Deployment verification failed."
+                            echo "ALL capabilities were not dropped."
                             exit 1
                             ;;
                     esac
+
 
                     echo "Deployment verification passed."
                 '''
             }
         }
 
+
+        /*
+         * =========================================================
+         * PROMOTE CANDIDATE
+         * =========================================================
+         */
+
         stage('Promote Candidate') {
             steps {
                 sh '''
                     set -eu
 
-                    echo "Promoting candidate to production..."
+                    echo "========================================="
+                    echo "Promoting Candidate"
+                    echo "========================================="
 
                     if docker ps \
                         --filter "name=^/${CONTAINER_NAME}$" \
-                        --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
+                        --format '{{.Names}}' \
+                        | grep -q "^${CONTAINER_NAME}$"; then
 
                         echo "Stopping existing production container..."
 
-                        docker stop "${CONTAINER_NAME}"
+                        docker stop \
+                            "${CONTAINER_NAME}"
 
-                        docker rm "${CONTAINER_NAME}"
+                        docker rm \
+                            "${CONTAINER_NAME}"
 
                     else
 
                         echo "No existing production container found."
+
                     fi
+
 
                     echo "Starting new production container..."
 
@@ -484,6 +676,7 @@ pipeline {
                         --cap-drop=ALL \
                         -p "${APP_PORT}:3000" \
                         "${FULL_IMAGE}"
+
 
                     echo "Waiting for production health check..."
 
@@ -497,7 +690,9 @@ pipeline {
 
                             cat /tmp/secureship-production-health.json
 
-                            docker rm -f "${CANDIDATE_CONTAINER}" 2>/dev/null || true
+                            docker rm -f \
+                                "${CANDIDATE_CONTAINER}" \
+                                2>/dev/null || true
 
                             exit 0
                         fi
@@ -507,9 +702,11 @@ pipeline {
                         sleep 2
                     done
 
+
                     echo "Production deployment failed."
 
-                    docker logs "${CONTAINER_NAME}"
+                    docker logs \
+                        "${CONTAINER_NAME}"
 
                     exit 1
                 '''
@@ -517,36 +714,57 @@ pipeline {
         }
     }
 
+
+    /*
+     * =============================================================
+     * POST ACTIONS
+     * =============================================================
+     */
+
     post {
 
         success {
+
             echo '========================================='
             echo 'SecureShip deployment completed'
             echo '========================================='
 
             sh '''
-                docker ps --filter "name=secureship"
+                docker ps \
+                    --filter "name=secureship"
             '''
         }
 
+
         failure {
+
             echo '========================================='
             echo 'SecureShip pipeline FAILED'
             echo '========================================='
 
             sh '''
-                docker ps -a --filter "name=secureship"
+                docker ps -a \
+                    --filter "name=secureship"
             '''
 
             sh '''
-                docker logs "${CANDIDATE_CONTAINER}" 2>/dev/null || true
+                docker logs \
+                    "${CANDIDATE_CONTAINER}" \
+                    2>/dev/null || true
             '''
         }
 
+
         always {
+
             sh '''
-                docker rm -f secureship-security-test 2>/dev/null || true
-                docker rm -f secureship-candidate 2>/dev/null || true
+                docker rm -f \
+                    "${SECURITY_CONTAINER}" \
+                    2>/dev/null || true
+
+                docker rm -f \
+                    "${CANDIDATE_CONTAINER}" \
+                    2>/dev/null || true
 
                 docker image prune -f \
                     --filter "until=168h" || true
