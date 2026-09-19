@@ -1,0 +1,53 @@
+pipeline {
+    agent any
+
+    stages {
+
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+
+        stage('Install Dependencies') {
+            steps {
+                dir('app') {
+                    sh 'npm install'
+                }
+            }
+        }
+
+        stage('Unit Tests') {
+            steps {
+                dir('app') {
+                    sh 'npm test -- --runInBand'
+                }
+            }
+        }
+
+        stage('Docker Build') {
+            steps {
+                sh 'docker build -t secureship:baseline .'
+            }
+        }
+
+        stage('Deploy') {
+            steps {
+                sh '''
+                    docker rm -f secureship || true
+
+                    docker run -d \
+                        --name secureship \
+                        -p 3000:3000 \
+                        secureship:baseline
+                '''
+            }
+        }
+    }
+
+    post {
+        always {
+            echo 'Baseline pipeline execution completed.'
+        }
+    }
+}
