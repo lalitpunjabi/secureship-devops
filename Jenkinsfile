@@ -564,11 +564,12 @@ pipeline {
                     echo "Deployment Verification"
                     echo "========================================="
 
+                    echo "Verifying container exists..."
                     docker inspect \
                         "${CANDIDATE_CONTAINER}" \
                         >/dev/null
 
-
+                    echo "Verifying container user..."
                     USER_NAME=$(docker exec \
                         "${CANDIDATE_CONTAINER}" \
                         whoami)
@@ -576,23 +577,64 @@ pipeline {
                     echo "Container user: ${USER_NAME}"
 
                     if [ "${USER_NAME}" != "node" ]; then
-                        echo "Deployment verification failed."
-                        echo "Container is running as ${USER_NAME}"
+                        echo "Deployment verification failed: container is not running as node."
                         exit 1
                     fi
 
+                    echo "Waiting for Docker health status..."
 
-                    HEALTH_STATUS=$(docker inspect \
-                        --format '{{.State.Health.Status}}' \
-                        "${CANDIDATE_CONTAINER}")
+                    MAX_ATTEMPTS=12
+                    ATTEMPT=1
+                    HEALTH_STATUS="starting"
 
-                    echo "Container health: ${HEALTH_STATUS}"
+                    while [ "${ATTEMPT}" -le "${MAX_ATTEMPTS}" ]; do
 
-                    if [ "${HEALTH_STATUS}" != "healthy" ]; then
-                        echo "Deployment verification failed."
-                        exit 1
-                    fi
+                        HEALTH_STATUS=$(docker inspect \
+                            --format '{{.State.Health.Status}}' \
+                            "${CANDIDATE_CONTAINER}")
 
+                        echo "Health attempt ${ATTEMPT}/${MAX_ATTEMPTS}: ${HEALTH_STATUS}"
+
+                        if [ "${HEALTH_STATUS}" = "healthy" ]; then
+                            echo "Docker health verification passed."
+                            break
+                        fi
+
+                        if [ "${HEALTH_STATUS}" = "unhealthy" ]; then
+                            echo "Deployment verification failed: container is unhealthy."
+                            docker logs "${CANDIDATE_CONTAINER}" || true
+                            exit 1
+                        fi
+
+                        if [ "${HEALTH_STATUS}" != "starting" ]; then
+                            echo "Deployment verification failed: unexpected health state ${HEALTH_STATUS}."
+                            docker logs "${CANDIDATE_CONTAINER}" || true
+                            exit 1
+                        fi
+
+                        if [ "${ATTEMPT}" -eq "${MAX_ATTEMPTS}" ]; then
+                            echo "Deployment verification failed: health check timeout."
+                            docker logs "${CANDIDATE_CONTAINER}" || true
+                            docker inspect \
+                                "${CANDIDATE_CONTAINER}" \
+                                --format '{{json .State.Health}}' || true
+                            exit 1
+                        fi
+
+                        ATTEMPT=$((ATTEMPT + 1))
+                        sleep 2
+                    done
+
+                    echo "Verifying candidate endpoint one final time..."
+
+                    curl --fail --silent --show-error \
+                        "http://127.0.0.1:${CANDIDATE_PORT}/health" \
+                        > /tmp/secureship-verification-health.json
+
+                    cat /tmp/secureship-verification-health.json
+                    echo
+
+                    echo "Checking read-only root filesystem..."
 
                     READONLY_ROOT=$(docker inspect \
                         --format '{{.HostConfig.ReadonlyRootfs}}' \
@@ -606,6 +648,7 @@ pipeline {
                         exit 1
                     fi
 
+                    echo "Checking dropped capabilities..."
 
                     CAP_DROP=$(docker inspect \
                         --format '{{json .HostConfig.CapDrop}}' \
@@ -623,7 +666,6 @@ pipeline {
                             exit 1
                             ;;
                     esac
-
 
                     echo "Deployment verification passed."
                 '''
